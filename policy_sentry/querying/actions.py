@@ -18,7 +18,7 @@ from policy_sentry.shared.iam_data import (
     get_service_prefix_data,
     iam_definition,
 )
-from policy_sentry.util.arns import get_service_from_arn
+from policy_sentry.util.arns import does_arn_match, get_service_from_arn
 
 all_service_prefixes = get_all_service_prefixes()
 logger = logging.getLogger(__name__)
@@ -487,6 +487,112 @@ def remove_actions_that_are_not_wildcard_arn_only(actions_list: list[str]) -> li
             # Let's return the CamelCase action name format
             results.append(action_data[service_prefix][0]["action"])
     return results
+
+
+def get_action_resource_requirements(service_prefix: str, action_name: str) -> dict[str, Any]:
+    """
+    Get the required and optional resource types of a single IAM action, including the raw ARN format for each one.
+
+    Arguments:
+        service_prefix: An AWS service prefix, like `s3` or `kms`. Case insensitive.
+        action_name: An IAM action name, like `RunInstances`. Case insensitive.
+    Returns:
+        Dictionary: Resource requirement details for the action:
+
+        - `action`: the canonical action name, like `ec2:RunInstances`, or `None` if the action is unknown
+        - `wildcard_only`: True when the action cannot be restricted to any resource ARN
+        - `required_resource_types`: resource types the action always needs
+        - `optional_resource_types`: resource types the action can use but does not require
+        - `condition_only_resource_types`: resource types the action references through condition keys only
+    """
+    result: dict[str, Any] = {
+        "action": None,
+        "wildcard_only": False,
+        "required_resource_types": [],
+        "optional_resource_types": [],
+        "condition_only_resource_types": [],
+    }
+    service_prefix_data = get_service_prefix_data(service_prefix)
+    if not service_prefix_data:
+        return result
+
+    canonical_action_name = service_prefix_data["privileges_lower_name"].get(action_name.lower())
+    if not canonical_action_name:
+        return result
+
+    action_data = service_prefix_data["privileges"][canonical_action_name]
+    canonical_service_prefix = service_prefix_data["prefix"]
+    result["action"] = f"{canonical_service_prefix}:{canonical_action_name}"
+
+    resource_types = action_data["resource_types"]
+    if len(resource_types) == 1 and "" in resource_types:
+        result["wildcard_only"] = True
+        return result
+
+    for resource_type_name, resource_type_entry in resource_types.items():
+        # The empty-string key holds condition keys that apply without a resource ARN, not a resource type.
+        if not resource_type_name:
+            result["condition_only_resource_types"].extend(resource_type_entry["condition_keys"])
+            continue
+
+        service_resource_data = service_prefix_data["resources"].get(resource_type_name)
+        raw_arn = service_resource_data.get("arn", "*") if service_resource_data else "*"
+        entry = {
+            "resource_type": resource_type_name,
+            "raw_arn": raw_arn,
+        }
+        if resource_type_entry.get("required"):
+            result["required_resource_types"].append(entry)
+        else:
+            result["optional_resource_types"].append(entry)
+
+    return result
+
+
+def get_missing_required_resource_types(actions: list[str], arns: list[str]) -> list[dict[str, Any]]:
+    """
+    Given requested IAM actions and the ARNs supplied in the request, report which required resource types are still
+    missing for every action, so the requester can add precise ARNs instead of opening up `Resource: "*"`.
+
+    Arguments:
+        actions: A list of requested IAM actions, like `["ec2:RunInstances"]`. Case insensitive.
+        arns: A list of concrete resource ARNs supplied in the request, like
+            `["arn:aws:ec2:us-east-1:123456789012:instance/i-1234567890abcdef0"]`. A bare `"*"` satisfies every
+            resource type. Matching ignores the ARN partition, so `aws`, `aws-cn` and `aws-us-gov` ARNs are accepted
+            against the same raw ARN format.
+    Returns:
+        List: One diagnostic dictionary per requested action. Each entry contains the action, the raw ARN format of
+        every required resource type, whether it is satisfied by a supplied ARN, the optional resource types (never
+        reported as missing), and `wildcard_only` for actions that can only use `Resource: "*"`. Entries for unknown
+        actions include `"unknown": true`.
+    """
+    diagnostics: list[dict[str, Any]] = []
+    for action in actions:
+        service_prefix, _, action_name = action.partition(":")
+        requirements = get_action_resource_requirements(service_prefix, action_name)
+        diagnostic: dict[str, Any] = {
+            "action": action,
+            "unknown": requirements["action"] is None,
+            "wildcard_only": requirements["wildcard_only"],
+            "required_resource_types": [],
+            "optional_resource_types": [entry["resource_type"] for entry in requirements["optional_resource_types"]],
+        }
+        if requirements["action"]:
+            diagnostic["action"] = requirements["action"]
+
+        for entry in requirements["required_resource_types"]:
+            satisfied = any(
+                supplied_arn == "*" or does_arn_match(supplied_arn, entry["raw_arn"]) for supplied_arn in arns
+            )
+            diagnostic["required_resource_types"].append(
+                {
+                    "resource_type": entry["resource_type"],
+                    "raw_arn": entry["raw_arn"],
+                    "satisfied": satisfied,
+                }
+            )
+        diagnostics.append(diagnostic)
+    return diagnostics
 
 
 def get_privilege_info(service_prefix: str, action: str) -> dict[str, Any]:

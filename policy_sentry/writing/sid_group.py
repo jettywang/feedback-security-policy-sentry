@@ -16,6 +16,7 @@ from policy_sentry.querying.actions import (
     get_actions_that_support_wildcard_arns_only,
     get_actions_with_arn_type_and_access_level,
     get_dependent_actions,
+    get_missing_required_resource_types,
 )
 from policy_sentry.querying.all import get_all_actions
 from policy_sentry.querying.arns import get_resource_type_name_with_raw_arn
@@ -451,6 +452,28 @@ class SidGroup:
         self.remove_actions_duplicated_in_wildcard_arn()
         logger.debug("Getting the rendered policy")
         return self.get_rendered_policy()
+
+    def get_missing_required_resources(
+        self, supplied_actions: list[str], supplied_arns: list[str]
+    ) -> list[dict[str, Any]]:
+        """
+        Diagnose which required resource types for the requested actions are not covered by a supplied ARN.
+
+        This is intended to run alongside policy generation: when a requester only supplies one resource type (for
+        example an instance ARN) while the action requires additional resource types, the diagnostics name each
+        missing type and its raw ARN format, so precise ARNs can be added instead of relaxing the statement to
+        `Resource: "*"`.
+
+        Arguments:
+            supplied_actions: A list of requested IAM actions, like `["ec2:RunInstances"]`.
+            supplied_arns: The concrete resource ARNs supplied in the request. A bare `"*"` satisfies every resource
+                type, and matching ignores the ARN partition.
+        Returns:
+            List: One diagnostic dictionary per requested action. Required types without a matching supplied ARN have
+                `satisfied: false`. Optional types are listed separately and never flagged as missing, and
+                wildcard-only actions report `wildcard_only: true`.
+        """
+        return get_missing_required_resource_types(supplied_actions, supplied_arns)
 
     def process_template(self, cfg: dict[str, Any], minimize: int | None = None) -> dict[str, Any]:
         """
