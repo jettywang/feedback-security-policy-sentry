@@ -45,6 +45,7 @@ nav:
     - Action Table: 'querying/action-table.md'
     - ARN Table: 'querying/arn-table.md'
     - Condition Table: 'querying/condition-table.md'
+    - Dependency Tree: 'querying/dependency-tree.md'
 
   - "<b>Other Topics</b>":
     - Terraform: 'other/terraform.md'
@@ -61,6 +62,7 @@ nav:
       - querying.actions: 'library-usage/querying/actions.md'
       - querying.arns: 'library-usage/querying/arns.md'
       - querying.conditions: 'library-usage/querying/conditions.md'
+      - querying.dependency_graph: 'library-usage/querying/dependency_graph.md'
       - shared.iam_data: 'library-usage/querying/iam_data.md'
     - "<b>Analysis</b>":
       - analyze.analysis: 'library-usage/analyzing.md'

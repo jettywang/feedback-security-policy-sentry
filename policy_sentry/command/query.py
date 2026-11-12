@@ -31,6 +31,7 @@ from policy_sentry.querying.conditions import (
     get_condition_key_details,
     get_condition_keys_for_service,
 )
+from policy_sentry.querying.dependency_graph import build_dependency_graph
 from policy_sentry.querying.services import get_services_data
 from policy_sentry.shared.constants import (
     DATASTORE_FILE_PATH,
@@ -361,5 +362,58 @@ def query_service_table(fmt: str = "json") -> list[dict[str, str]]:
         logger.debug("Leveraging the bundled IAM Definition.")
 
     output = get_services_data()
+    print_dict(output=output, fmt=fmt)
+    return output
+
+
+@query.command(
+    short_help="Resolve the full transitive dependency graph of one or more IAM actions, "
+    "including paths and the resource scopes a user must supply."
+)
+@click.option(
+    "--action",
+    "-a",
+    "actions",
+    type=str,
+    required=True,
+    multiple=True,
+    help="An IAM action to analyze, e.g. 'ec2:AssociateIamInstanceProfile'. Repeat for more actions.",
+)
+@click.option(
+    "--fmt",
+    type=click.Choice(["yaml", "json"]),
+    default="json",
+    required=False,
+    help='Format output as YAML or JSON. Defaults to "json"',
+)
+@click.option(
+    "--verbose",
+    "-v",
+    type=click.Choice(["critical", "error", "warning", "info", "debug"], case_sensitive=False),
+)
+def dependency_tree(actions: tuple[str, ...], fmt: str, verbose: str | None) -> dict[str, Any]:
+    """Show every transitive dependency, the paths reaching it, cycles and missing metadata."""
+    if verbose:
+        log_level = getattr(logging, verbose.upper())
+        set_stream_logger(level=log_level)
+    return query_dependency_tree(list(actions), fmt)
+
+
+def query_dependency_tree(actions: list[str], fmt: str = "json") -> dict[str, Any]:
+    """Build the dependency review report for the supplied actions.
+
+    Use this one when leveraging Policy Sentry as a library. The report marks
+    dependencies that are safe to render automatically (``scoped`` or
+    ``wildcard_only``) separately from those that require a user-supplied
+    resource scope (``needs_resource_scope`` or ``missing_metadata``).
+    """
+    if LOCAL_DATASTORE_FILE_PATH.exists():
+        logger.info(
+            f"Using the Local IAM definition: {LOCAL_DATASTORE_FILE_PATH}. To leverage the bundled definition instead, remove the folder $HOME/.policy_sentry/"
+        )
+    else:
+        logger.debug("Leveraging the bundled IAM Definition.")
+
+    output = build_dependency_graph(actions)
     print_dict(output=output, fmt=fmt)
     return output

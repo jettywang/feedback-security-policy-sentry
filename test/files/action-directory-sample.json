@@ -1,0 +1,229 @@
+{
+  "policy_sentry_schema_version": "sample-fixture-v1",
+  "depsvc": {
+    "service_name": "Dependency Sample Service",
+    "prefix": "depsvc",
+    "service_authorization_url": "https://example.invalid/depsvc",
+    "privileges": {
+      "RootAction": {
+        "privilege": "RootAction",
+        "description": "Entry point that starts a multi-level dependency chain",
+        "access_level": "Write",
+        "resource_types": {
+          "workload": {
+            "resource_type": "workload",
+            "required": true,
+            "condition_keys": [],
+            "dependent_actions": ["depsvc:LevelOne"]
+          }
+        },
+        "resource_types_lower_name": {"workload": "workload"},
+        "api_documentation_link": null
+      },
+      "LevelOne": {
+        "privilege": "LevelOne",
+        "description": "Second level of the chain, also references the shared dependency",
+        "access_level": "Write",
+        "resource_types": {
+          "workload": {
+            "resource_type": "workload",
+            "required": true,
+            "condition_keys": [],
+            "dependent_actions": ["depsvc:LevelTwo", "depsvc:SharedAction"]
+          }
+        },
+        "resource_types_lower_name": {"workload": "workload"},
+        "api_documentation_link": null
+      },
+      "LevelTwo": {
+        "privilege": "LevelTwo",
+        "description": "Third level of the chain, also references the shared dependency",
+        "access_level": "Write",
+        "resource_types": {
+          "workload": {
+            "resource_type": "workload",
+            "required": true,
+            "condition_keys": [],
+            "dependent_actions": ["depsvc:SharedAction", "othersvc:DifferentArnAction"]
+          }
+        },
+        "resource_types_lower_name": {"workload": "workload"},
+        "api_documentation_link": null
+      },
+      "SharedAction": {
+        "privilege": "SharedAction",
+        "description": "Reachable through more than one path and from more than one root",
+        "access_level": "Write",
+        "resource_types": {
+          "workload": {
+            "resource_type": "workload",
+            "required": true,
+            "condition_keys": [],
+            "dependent_actions": []
+          }
+        },
+        "resource_types_lower_name": {"workload": "workload"},
+        "api_documentation_link": null
+      },
+      "CycleA": {
+        "privilege": "CycleA",
+        "description": "First node of a two-node dependency cycle",
+        "access_level": "Write",
+        "resource_types": {
+          "workload": {
+            "resource_type": "workload",
+            "required": true,
+            "condition_keys": [],
+            "dependent_actions": ["depsvc:CycleB"]
+          }
+        },
+        "resource_types_lower_name": {"workload": "workload"},
+        "api_documentation_link": null
+      },
+      "CycleB": {
+        "privilege": "CycleB",
+        "description": "Second node of a two-node dependency cycle",
+        "access_level": "Write",
+        "resource_types": {
+          "workload": {
+            "resource_type": "workload",
+            "required": true,
+            "condition_keys": [],
+            "dependent_actions": ["depsvc:CycleA"]
+          }
+        },
+        "resource_types_lower_name": {"workload": "workload"},
+        "api_documentation_link": null
+      },
+      "SelfLoop": {
+        "privilege": "SelfLoop",
+        "description": "Action that lists itself as a dependency",
+        "access_level": "Write",
+        "resource_types": {
+          "workload": {
+            "resource_type": "workload",
+            "required": true,
+            "condition_keys": [],
+            "dependent_actions": ["depsvc:SelfLoop"]
+          }
+        },
+        "resource_types_lower_name": {"workload": "workload"},
+        "api_documentation_link": null
+      },
+      "BrokenMetadata": {
+        "privilege": "BrokenMetadata",
+        "description": "References an action that is absent from the local directory",
+        "access_level": "Write",
+        "resource_types": {
+          "workload": {
+            "resource_type": "workload",
+            "required": true,
+            "condition_keys": [],
+            "dependent_actions": ["ghostsvc:NotInDirectory"]
+          }
+        },
+        "resource_types_lower_name": {"workload": "workload"},
+        "api_documentation_link": null
+      },
+      "WildcardOnlyAction": {
+        "privilege": "WildcardOnlyAction",
+        "description": "Wildcard-only action that legitimately renders on Resource *",
+        "access_level": "List",
+        "resource_types": {
+          "": {
+            "resource_type": "",
+            "required": false,
+            "condition_keys": [],
+            "dependent_actions": []
+          }
+        },
+        "resource_types_lower_name": {"": ""},
+        "api_documentation_link": null
+      },
+      "NeedsWildcard": {
+        "privilege": "NeedsWildcard",
+        "description": "Entry point whose only dependency is wildcard-only",
+        "access_level": "Write",
+        "resource_types": {
+          "workload": {
+            "resource_type": "workload",
+            "required": true,
+            "condition_keys": [],
+            "dependent_actions": ["depsvc:WildcardOnlyAction"]
+          }
+        },
+        "resource_types_lower_name": {"workload": "workload"},
+        "api_documentation_link": null
+      },
+      "SecondRoot": {
+        "privilege": "SecondRoot",
+        "description": "Second entry point that shares SharedAction with the first chain",
+        "access_level": "Write",
+        "resource_types": {
+          "workload": {
+            "resource_type": "workload",
+            "required": true,
+            "condition_keys": [],
+            "dependent_actions": ["depsvc:SharedAction"]
+          }
+        },
+        "resource_types_lower_name": {"workload": "workload"},
+        "api_documentation_link": null
+      }
+    },
+    "privileges_lower_name": {
+      "rootaction": "RootAction",
+      "levelone": "LevelOne",
+      "leveltwo": "LevelTwo",
+      "sharedaction": "SharedAction",
+      "cyclea": "CycleA",
+      "cycleb": "CycleB",
+      "selfloop": "SelfLoop",
+      "brokenmetadata": "BrokenMetadata",
+      "wildcardonlyaction": "WildcardOnlyAction",
+      "needswildcard": "NeedsWildcard",
+      "secondroot": "SecondRoot"
+    },
+    "resources": {
+      "workload": {
+        "resource": "workload",
+        "arn": "arn:${Partition}:depsvc:${Region}:${Account}:workload/${WorkloadId}",
+        "condition_keys": []
+      }
+    },
+    "resources_lower_name": {"workload": "workload"},
+    "conditions": {}
+  },
+  "othersvc": {
+    "service_name": "Other Sample Service",
+    "prefix": "othersvc",
+    "service_authorization_url": "https://example.invalid/othersvc",
+    "privileges": {
+      "DifferentArnAction": {
+        "privilege": "DifferentArnAction",
+        "description": "Dependency that requires a resource ARN of a different service/type",
+        "access_level": "Write",
+        "resource_types": {
+          "connector": {
+            "resource_type": "connector",
+            "required": true,
+            "condition_keys": [],
+            "dependent_actions": []
+          }
+        },
+        "resource_types_lower_name": {"connector": "connector"},
+        "api_documentation_link": null
+      }
+    },
+    "privileges_lower_name": {"differentarnaction": "DifferentArnAction"},
+    "resources": {
+      "connector": {
+        "resource": "connector",
+        "arn": "arn:${Partition}:othersvc:${Region}:${Account}:connector/${ConnectorId}",
+        "condition_keys": []
+      }
+    },
+    "resources_lower_name": {"connector": "connector"},
+    "conditions": {}
+  }
+}

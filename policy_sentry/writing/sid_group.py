@@ -15,10 +15,14 @@ from policy_sentry.querying.actions import (
     get_actions_matching_arn_type,
     get_actions_that_support_wildcard_arns_only,
     get_actions_with_arn_type_and_access_level,
-    get_dependent_actions,
 )
 from policy_sentry.querying.all import get_all_actions
 from policy_sentry.querying.arns import get_resource_type_name_with_raw_arn
+from policy_sentry.querying.dependency_graph import (
+    STATUS_MISSING_METADATA,
+    STATUS_NEEDS_RESOURCE_SCOPE,
+    build_dependency_graph,
+)
 from policy_sentry.shared.constants import POLICY_LANGUAGE_VERSION
 from policy_sentry.util.actions import get_lowercase_action_list
 from policy_sentry.util.arns import does_arn_match, get_service_from_arn, parse_arn
@@ -73,6 +77,15 @@ class SidGroup:
         self.wildcard_only_service_list: list[str] = []
         self.wildcard_only_service_tagging: list[str] = []
         self.wildcard_only_service_permissions_management: list[str] = []
+        # Dependency review bookkeeping. Dependencies that cannot be rendered
+        # safely are held here instead of being emitted on Resource "*".
+        self.dependency_reviews: list[dict[str, Any]] = []
+        self.pending_dependency_actions: set[str] = set()
+        # User-supplied resource scopes keyed by lowercase action.
+        self.dependency_resource_scopes: dict[str, list[str]] = {}
+        # De-duplicates "held for review" warnings when the same dependency is
+        # reached through several ARN/access-level expansions.
+        self.warned_dependency_actions: set[str] = set()
 
     def get_sid_group(self) -> dict[str, dict[str, Any]]:
         """
@@ -115,6 +128,172 @@ class SidGroup:
             self.skip_resource_constraints.append(skip_resource_constraints_actions)
         else:
             raise Exception("Please provide 'skip_resource_constraints' as a list of IAM actions.")
+
+    def review_dependent_actions(self, requested_actions: list[str]) -> dict[str, Any]:
+        """Build a reviewable report of every transitive dependency of the requested actions.
+
+        The report records the path from each requested action to each
+        dependency and flags dependencies that need a user-supplied resource
+        scope (different ARN type) or whose metadata is missing locally. It
+        never renders policy statements itself.
+        """
+        report = build_dependency_graph(requested_actions)
+        self.dependency_reviews.append(
+            {
+                "requested_actions": requested_actions,
+                "report": report,
+            }
+        )
+        for entry in report["dependencies"]:
+            if entry["status"] in (STATUS_NEEDS_RESOURCE_SCOPE, STATUS_MISSING_METADATA):
+                self.pending_dependency_actions.add(entry["action"].lower())
+        return report
+
+    def add_dependency_resource_scope(self, action: str, arns: str | list[str]) -> None:
+        """Supply the resource ARN(s) a flagged dependency should be restricted to.
+
+        Arguments:
+            action: The dependency action that was flagged as needing a scope,
+                e.g. `iam:PassRole`.
+            arns: One or more concrete resource ARNs. Each ARN must match one
+                of the action's ARN formats in the local directory.
+        """
+        if isinstance(arns, str):
+            arn_list = [arns]
+        else:
+            arn_list = list(arns)
+        if not arn_list:
+            raise Exception("Please provide at least one resource ARN for the dependency.")
+
+        service_name, action_name = action.split(":", 1)
+        action_data = get_action_data(service_name, action_name)
+        rows = action_data.get(service_name, [])
+        if not rows:
+            raise Exception(f"Could not find service action data for {action}.")
+        supported_formats = {row["resource_arn_format"] for row in rows}
+        for arn in arn_list:
+            if not any(does_arn_match(arn, arn_format) for arn_format in supported_formats):
+                raise Exception(f"ARN {arn} does not match any resource type supported by {action}.")
+
+        action_key = action.lower()
+        existing = self.dependency_resource_scopes.setdefault(action_key, [])
+        existing.extend(arn for arn in arn_list if arn not in existing)
+        self.pending_dependency_actions.discard(action_key)
+        # Re-render immediately so a scope supplied after the initial policy
+        # build still lands in the rendered statements.
+        self._render_scoped_dependency(action)
+
+    def get_dependency_review(self) -> dict[str, Any]:
+        """Return the accumulated, de-duplicated review findings for inspection."""
+        findings: dict[str, dict[str, Any]] = {}
+        for review in self.dependency_reviews:
+            requested_actions = review["requested_actions"]
+            report = review["report"]
+            for entry in report["dependencies"]:
+                action_key = entry["action"].lower()
+                finding = findings.setdefault(
+                    action_key,
+                    {
+                        "action": entry["action"],
+                        "status": entry["status"],
+                        "paths": [],
+                        "resource_arn_formats": entry["resource_arn_formats"],
+                        "requested_by": [],
+                        "supplied_resource_scopes": self.dependency_resource_scopes.get(action_key, []),
+                    },
+                )
+                for path in entry["paths"]:
+                    if path not in finding["paths"]:
+                        finding["paths"].append(path)
+                for requested_action in requested_actions:
+                    if requested_action not in finding["requested_by"]:
+                        finding["requested_by"].append(requested_action)
+            for cycle in report["cycles"]:
+                if cycle not in findings.setdefault("__cycles__", {"paths": []})["paths"]:
+                    findings["__cycles__"]["paths"].append(cycle)
+
+        cycles = findings.pop("__cycles__", {"paths": []})["paths"]
+        return {
+            "dependencies": [findings[key] for key in sorted(findings)],
+            "cycles": cycles,
+            "pending_resource_scopes": sorted(self.pending_dependency_actions),
+        }
+
+    def _render_scoped_dependency(self, action: str) -> bool:
+        """Render a dependency whose resource scope was supplied. Returns True if rendered."""
+        arns = self.dependency_resource_scopes.get(action.lower())
+        if not arns:
+            return False
+        service_name, action_name = action.split(":", 1)
+        rows = get_action_data(service_name, action_name).get(service_name, [])
+        rendered = False
+        for arn in arns:
+            for row in rows:
+                if row["resource_arn_format"] != "*" and does_arn_match(arn, row["resource_arn_format"]):
+                    resource_type_name = get_resource_type_name_with_raw_arn(row["resource_arn_format"])
+                    if resource_type_name is None:
+                        continue
+                    sid_namespace = create_policy_sid_namespace(
+                        service_name, row["access_level"], resource_type_name
+                    )
+                    if sid_namespace in self.sids:
+                        if action not in self.sids[sid_namespace]["actions"]:
+                            self.sids[sid_namespace]["actions"].append(action)
+                        if arn not in self.sids[sid_namespace]["arn"]:
+                            self.sids[sid_namespace]["arn"].append(arn)
+                    else:
+                        self.sids[sid_namespace] = {
+                            "arn": [arn],
+                            "service": service_name,
+                            "access_level": row["access_level"],
+                            "arn_format": row["resource_arn_format"],
+                            "actions": [action],
+                            "conditions": [],
+                        }
+                    rendered = True
+        return rendered
+
+    def add_dependent_action_with_review(self, action: str) -> None:
+        """Add a dependency action, refusing to emit an unscoped wildcard Allow.
+
+        * wildcard-only actions with directory metadata are added under
+          Resource "*" because AWS defines no resource-level scope for them;
+        * actions with a user-supplied scope are rendered against that ARN;
+        * anything else (different ARN type or missing metadata) is held in
+          the pending list and excluded from the generated policy.
+        """
+        action_key = action.lower()
+        if action_key in self.skip_resource_constraints:
+            self.add_action_without_resource_constraint(action, "SkipResourceConstraints")
+            self.pending_dependency_actions.discard(action_key)
+            return
+        if self._render_scoped_dependency(action):
+            return
+
+        service_name, action_name = action.split(":", 1)
+        rows = get_action_data(service_name, action_name).get(service_name, [])
+        if not rows:
+            self.pending_dependency_actions.add(action_key)
+            if action_key not in self.warned_dependency_actions:
+                self.warned_dependency_actions.add(action_key)
+                logger.warning(
+                    "Holding dependency %s: metadata missing from the local action directory. "
+                    "Supply a resource scope after confirming the action manually.",
+                    action,
+                )
+            return
+        if len(rows) == 1 and rows[0]["resource_arn_format"] == "*":
+            self.add_action_without_resource_constraint(action)
+            return
+
+        self.pending_dependency_actions.add(action_key)
+        if action_key not in self.warned_dependency_actions:
+            self.warned_dependency_actions.add(action_key)
+            logger.warning(
+                "Holding dependency %s: it requires a different resource ARN than the request. "
+                "Call add_dependency_resource_scope() before it can be added to the policy.",
+                action,
+            )
 
     def add_sts_actions(self, sts_actions: dict[str, list[str]]) -> None:
         """
@@ -285,6 +464,7 @@ class SidGroup:
         arn_list: list[str],
         access_level: str,
         _conditions_block: dict[str, Any] | None = None,
+        requested_actions_filter: set[str] | None = None,
     ) -> None:
         """
         This adds the user-supplied ARN(s), service prefixes, access levels, and condition keys (if applicable) given
@@ -294,6 +474,10 @@ class SidGroup:
             arn_list: Just a list of resource ARNs.
             access_level: "Read", "List", "Tagging", "Write", or "Permissions management"
             conditions_block: Optionally, a condition block with one or more conditions
+            requested_actions_filter: When set, actions-mode callers restrict
+                the SID to these canonical actions (plus their dependencies) so
+                unrelated actions sharing the access level are never reviewed
+                or rendered.
         """
         for arn in arn_list:
             service_prefix = get_service_from_arn(arn)
@@ -314,22 +498,33 @@ class SidGroup:
                         actions = get_actions_with_arn_type_and_access_level(
                             service_prefix, resource_type_name, access_level
                         )
-                        # List comprehension to get all dependent actions that are not in the supplied actions.
+                        if requested_actions_filter is not None:
+                            actions = [
+                                action
+                                for action in actions
+                                if action.lower() in requested_actions_filter
+                            ]
+                            if not actions:
+                                continue
+                        # Walk the full transitive graph, not just single-level
+                        # dependencies, so multi-level chains are covered.
+                        review_report = self.review_dependent_actions(actions)
                         dependent_actions = [
-                            action for action in get_dependent_actions(actions) if action not in actions
+                            entry["action"]
+                            for entry in review_report["dependencies"]
+                            if entry["action"] not in actions
                         ]
-                        # Check if dependent actions support the same resource type.
-                        # If so, add them to the same SID with the specific ARN
-                        # instead of defaulting to wildcard "*".
                         actions_matching_resource_type = get_actions_matching_arn_type(
                             service_prefix, resource_type_name
                         )
                         for dep_action in dependent_actions:
                             if dep_action in actions_matching_resource_type:
+                                # Same resource type as the request: the
+                                # specific ARN already scopes this action.
                                 if dep_action not in actions:
                                     actions.append(dep_action)
                             else:
-                                self.add_action_without_resource_constraint(dep_action)
+                                self.add_dependent_action_with_review(dep_action)
 
                         if sid_namespace in self.sids:
                             # If the ARN already exists there, skip it.
@@ -393,8 +588,14 @@ class SidGroup:
         Arguments:
             supplied_actions: A list of supplied actions
         """
+        # Full transitive review up front so multi-level chains, cycles and
+        # missing metadata are all visible even where rendering only uses the
+        # direct dependencies.
+        review_report = self.review_dependent_actions(supplied_actions)
         dependent_actions = [
-            action for action in get_dependent_actions(supplied_actions) if action not in supplied_actions
+            entry["action"]
+            for entry in review_report["dependencies"]
+            if entry["action"] not in supplied_actions
         ]
         logger.debug("Adding by list of actions")
         logger.debug(f"Supplied actions: {supplied_actions}")
@@ -419,28 +620,49 @@ class SidGroup:
                         }
                     )
 
+        # Restrict access-level expansion to the supplied actions so unrelated
+        # actions sharing the ARN type are neither reviewed nor rendered.
+        requested_actions_filter = {action.lower() for action in supplied_actions}
+
         # Identify the actions that do not support resource constraints
         # If that's the case, add it to the wildcard namespace. Otherwise, don't add it.
 
         actions_without_resource_constraints = []
         for item in arns_matching_supplied_actions:
             if item["resource_arn_format"] != "*":
-                self.add_by_arn_and_access_level([item["resource_arn_format"]], item["access_level"])
+                # This also renders the transitive dependencies that share the
+                # resource type and reviews the rest.
+                self.add_by_arn_and_access_level(
+                    [item["resource_arn_format"]],
+                    item["access_level"],
+                    requested_actions_filter=requested_actions_filter,
+                )
             else:
                 actions_without_resource_constraints.append(item["action"])
 
-        # If there are any dependent actions, we need to add them without resource constraints.
-        # Otherwise, we get into issues where the amount of extra SIDs will balloon.
-        # Also, the user has no way of knowing what those dependent actions are beforehand.
-        # TODO: This is, in fact, a great opportunity to introduce conditions. But we aren't there yet.
+        # Dependencies not attached to a resource-specific SID above go through
+        # explicit review: wildcard-only actions with directory metadata can
+        # still be added under "*", while dependencies needing a different ARN
+        # (or missing metadata) are held until the user supplies a scope.
+        rendered_dependency_actions = {
+            action.lower()
+            for group in self.sids.values()
+            for action in group["actions"]
+        }
         for dep_action in dependent_actions:
-            self.add_action_without_resource_constraint(dep_action)
+            if dep_action.lower() not in rendered_dependency_actions:
+                self.add_dependent_action_with_review(dep_action)
         # Now, because add_by_arn_and_access_level() adds all actions under an access level, we have to
-        # remove all actions that do not match the supplied_actions. This is done in-place.
-        logger.debug("Purging actions that do not match the requested actions and dependent actions")
+        # remove all actions that do not match the supplied actions or the dependencies that were actually rendered.
+        rendered_dependencies = [
+            action
+            for action in dependent_actions
+            if action.lower() not in self.pending_dependency_actions
+        ]
+        logger.debug("Purging actions that do not match the requested actions and rendered dependent actions")
         logger.debug(f"Supplied actions: {supplied_actions}")
-        logger.debug(f"Dependent actions: {dependent_actions}")
-        self.remove_actions_not_matching_these(supplied_actions + dependent_actions)
+        logger.debug(f"Rendered dependent actions: {rendered_dependencies}")
+        self.remove_actions_not_matching_these(supplied_actions + rendered_dependencies)
         for action in actions_without_resource_constraints:
             logger.debug(f"Deliberately adding the action {action} without resource constraints")
             self.add_action_without_resource_constraint(action)

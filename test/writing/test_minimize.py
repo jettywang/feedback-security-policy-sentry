@@ -249,8 +249,12 @@ class MinimizeWildcardActionsTestCase(unittest.TestCase):
         # To future-proof this unit test...
         # (1) check that there is only one SID so it was combined during minimization
         sid_names = get_sid_names_from_policy(results)
-        # For S3, it does require iam:PassRole lol because of s3:PutReplicationConfiguration requiring it as an action
-        self.assertEqual(len(sid_names), 2, "More than 2 statements returned, expected 2")
+        # s3:PutReplicationConfiguration lists iam:PassRole as a dependency, but
+        # PassRole targets an IAM role ARN rather than the bucket. It must not
+        # be widened to Resource "*", so it is held pending a user scope and no
+        # second statement is generated.
+        self.assertEqual(len(sid_names), 1, "Only the resource-scoped statement should be generated")
+        self.assertIn("iam:passrole", sid_group.get_dependency_review()["pending_resource_scopes"])
 
     def test_minimize_arn_case_1(self):
         """minimization test with ARN types from test_does_arn_match_case_1"""
@@ -302,7 +306,11 @@ class MinimizeWildcardActionsTestCase(unittest.TestCase):
         sid_group = SidGroup()
         results = sid_group.process_template(cfg, minimize=0)
         sid_names = get_sid_names_from_policy(results)
-        self.assertEqual(len(sid_names), 2, "More than two statements returned, expected 2")
+        # Step Functions write actions reference iam:PassRole, which targets an
+        # IAM role ARN. It is held pending a user-supplied scope rather than
+        # emitted on Resource "*", leaving a single state-machine statement.
+        self.assertEqual(len(sid_names), 1, "More than one statement returned, expected 1")
+        self.assertIn("iam:passrole", sid_group.get_dependency_review()["pending_resource_scopes"])
 
     def test_minimize_arn_case_6(self):
         """minimization test with ARN types from test_does_arn_match_case_6"""

@@ -213,30 +213,26 @@ class SidGroupCrudTestCase(unittest.TestCase):
     def test_resource_restriction_plus_dependent_action(self):
         """
         test_resource_restriction_plus_dependent_action
+
+        The organizations dependencies require Organizations ARNs (or no
+        resource-level scope for ListRoots). Only the genuinely wildcard-only
+        action may be emitted on '*'; every scoped dependency is held for
+        review rather than silently widened.
         """
-        # Given iam:generateorganizationsaccessreport with resource constraint, make sure these are added:
-        #  organizations:DescribePolicy,organizations:ListChildren,organizations:ListParents,
-        #  organizations:ListPoliciesForTarget,organizations:ListRoots,organizations:ListTargetsForPolicy
         actions_test_data_1 = ["iam:generateorganizationsaccessreport"]
         sid_group = SidGroup()
         sid_group.add_by_list_of_actions(actions_test_data_1)
         output = sid_group.get_rendered_policy()
-        # print(json.dumps(rendered_policy, indent=4))
         desired_output = {
             "Version": "2012-10-17",
             "Statement": [
                 {
+                    "Sid": "MultMultNone",
                     "Effect": "Allow",
                     "Action": [
-                        "organizations:DescribePolicy",
-                        "organizations:ListChildren",
-                        "organizations:ListParents",
-                        "organizations:ListPoliciesForTarget",
                         "organizations:ListRoots",
-                        "organizations:ListTargetsForPolicy",
                     ],
                     "Resource": ["*"],
-                    "Sid": "MultMultNone",
                 },
                 {
                     "Sid": "IamReadAccessreport",
@@ -247,17 +243,23 @@ class SidGroupCrudTestCase(unittest.TestCase):
             ],
         }
         self.maxDiff = None
-        # print(json.dumps(output, indent=4))
         self.assertDictEqual(output, desired_output)
+        pending = sid_group.get_dependency_review()["pending_resource_scopes"]
+        self.assertCountEqual(
+            pending,
+            [
+                "organizations:describepolicy",
+                "organizations:listchildren",
+                "organizations:listparents",
+                "organizations:listpoliciesfortarget",
+                "organizations:listtargetsforpolicy",
+            ],
+        )
 
     def test_resource_restriction_plus_dependent_action_simple_2(self):
         """
         test_resource_restriction_plus_dependent_action_simple_2
         """
-        # Given iam:generateorganizationsaccessreport with resource constraint, make sure these are added:
-        #  organizations:DescribePolicy,organizations:ListChildren,organizations:ListParents,
-        #  organizations:ListPoliciesForTarget,organizations:ListRoots,organizations:ListTargetsForPolicy
-
         sid_group = SidGroup()
         sid_group.add_by_arn_and_access_level(["arn:aws:iam::000000000000:access-report/somepath"], "Read")
         output = sid_group.get_rendered_policy()
@@ -268,12 +270,7 @@ class SidGroupCrudTestCase(unittest.TestCase):
                     "Sid": "MultMultNone",
                     "Effect": "Allow",
                     "Action": [
-                        "organizations:DescribePolicy",
-                        "organizations:ListChildren",
-                        "organizations:ListParents",
-                        "organizations:ListPoliciesForTarget",
                         "organizations:ListRoots",
-                        "organizations:ListTargetsForPolicy",
                     ],
                     "Resource": ["*"],
                 },
@@ -285,8 +282,11 @@ class SidGroupCrudTestCase(unittest.TestCase):
                 },
             ],
         }
-        # print(json.dumps(output, indent=4))
+        self.maxDiff = None
         self.assertDictEqual(output, desired_output)
+        pending = sid_group.get_dependency_review()["pending_resource_scopes"]
+        self.assertIn("organizations:describepolicy", pending)
+        self.assertIn("organizations:listchildren", pending)
 
     def test_add_by_arn_and_access_level_ignores_placeholder_services(self):
         # https://github.com/salesforce/policy_sentry/issues/448
@@ -319,7 +319,6 @@ class SidGroupCrudTestCase(unittest.TestCase):
                     "Action": [
                         "cloudhsm:DescribeClusters",
                         "ec2:DescribeVpcEndpointServices",
-                        "iam:CreateServiceLinkedRole",
                         "kms:CreateCustomKeyStore",
                     ],
                     "Resource": ["*"],
@@ -329,6 +328,12 @@ class SidGroupCrudTestCase(unittest.TestCase):
         print(json.dumps(output, indent=4))
         self.maxDiff = None
         self.assertDictEqual(output, desired_output)
+        # iam:CreateServiceLinkedRole supports a role ARN, so it is held for a
+        # user-supplied scope instead of being widened to Resource "*".
+        self.assertEqual(
+            sid_group.get_dependency_review()["pending_resource_scopes"],
+            ["iam:createservicelinkedrole"],
+        )
 
     #     def test_add_crud_with_wildcard(self):
     #         cfg = {
@@ -615,14 +620,53 @@ class SidGroupCrudTestCase(unittest.TestCase):
         # so they should be scoped to the specific ARN, not wildcard
         self.assertIn("kms:PutKeyPolicy", actions_by_sid.get("KmsWriteKey", []))
         self.assertIn("kms:TagResource", actions_by_sid.get("KmsWriteKey", []))
-        # kms:CreateKey is wildcard-only and iam:CreateServiceLinkedRole is a
-        # different service, so both should remain under '*'
+        # kms:CreateKey is wildcard-only, so it remains under '*'.
+        # iam:CreateServiceLinkedRole supports a role ARN of a different
+        # service: it must NOT be auto-rendered on '*' and is held for the
+        # user to supply a resource scope instead.
         wildcard_actions = actions_by_sid.get("MultMultNone", [])
         self.assertIn("kms:CreateKey", wildcard_actions)
-        self.assertIn("iam:CreateServiceLinkedRole", wildcard_actions)
+        self.assertNotIn("iam:CreateServiceLinkedRole", wildcard_actions)
         # Verify they are NOT duplicated in the wildcard SID
         self.assertNotIn("kms:PutKeyPolicy", wildcard_actions)
         self.assertNotIn("kms:TagResource", wildcard_actions)
+        pending = sid_group.get_dependency_review()["pending_resource_scopes"]
+        self.assertIn("iam:createservicelinkedrole", pending)
+
+    def test_dependent_action_renders_after_resource_scope_supplied(self):
+        """A held dependency is rendered against its supplied ARN, never on '*'."""
+        sid_group = SidGroup()
+        sid_group.add_by_arn_and_access_level(
+            ["arn:aws:kms:us-east-1:123456789012:key/shaq"],
+            "Write",
+        )
+        self.assertIn(
+            "iam:createservicelinkedrole",
+            sid_group.get_dependency_review()["pending_resource_scopes"],
+        )
+        role_arn = "arn:aws:iam::123456789012:role/aws-service-role/kms.amazonaws.com/AWSServiceRoleForKeyManagementService"
+        sid_group.add_dependency_resource_scope("iam:CreateServiceLinkedRole", role_arn)
+
+        result = sid_group.get_rendered_policy()
+        actions_by_sid = {stmt["Sid"]: stmt for stmt in result["Statement"]}
+        rendered = next(
+            stmt for stmt in actions_by_sid.values() if "iam:CreateServiceLinkedRole" in stmt["Action"]
+        )
+        self.assertEqual(rendered["Resource"], [role_arn])
+        self.assertEqual(rendered["Sid"], "IamPermissionsmanagementRole")
+        self.assertNotIn("iam:CreateServiceLinkedRole", actions_by_sid.get("MultMultNone", {"Action": []})["Action"])
+        self.assertEqual(sid_group.get_dependency_review()["pending_resource_scopes"], [])
+
+    def test_dependency_resource_scope_rejects_mismatched_arn(self):
+        sid_group = SidGroup()
+        sid_group.add_by_arn_and_access_level(
+            ["arn:aws:kms:us-east-1:123456789012:key/shaq"],
+            "Write",
+        )
+        with self.assertRaises(Exception):
+            sid_group.add_dependency_resource_scope(
+                "iam:CreateServiceLinkedRole", "arn:aws:s3:::not-a-role"
+            )
 
     def test_write_template_with_sts_actions(self):
         cfg = {
