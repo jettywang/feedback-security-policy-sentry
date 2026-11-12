@@ -93,6 +93,18 @@ class RegisterMinimizeLengthCommand(click.Command):
     default=0,
 )
 @click.option(
+    "--conservative",
+    "-c",
+    is_flag=True,
+    required=False,
+    default=False,
+    help=(
+        "Conservative compression. Narrow prefix wildcards are kept as explicit actions so a future "
+        "same-prefix AWS action cannot silently widen the grant; only the service-wide wildcard "
+        "(e.g. s3:*) is retained, and only when every action in that service is approved."
+    ),
+)
+@click.option(
     "--fmt",
     type=click.Choice(["yaml", "json", "terraform"]),
     default="json",
@@ -108,6 +120,7 @@ def write_policy(
     input_file: str | Path,
     minimize: int,
     minimize_length: int,
+    conservative: bool,
     fmt: str,
     verbose: str | None,
 ) -> None:
@@ -130,7 +143,7 @@ def write_policy(
     min_length = None
     if minimize:
         min_length = minimize_length
-    policy = write_policy_with_template(cfg, min_length)
+    policy = write_policy_with_template(cfg, min_length, conservative=conservative)
 
     if fmt == "yaml":
         policy_str = yaml.dump(policy, sort_keys=False)
@@ -143,15 +156,20 @@ def write_policy(
     print(policy_str)
 
 
-def write_policy_with_template(cfg: dict[str, Any], minimize: int | None = None) -> dict[str, Any]:
+def write_policy_with_template(
+    cfg: dict[str, Any], minimize: int | None = None, conservative: bool = False
+) -> dict[str, Any]:
     """
     This function is called by write-policy so the config can be passed in as a dict without running into a Click-related error. Use this function, rather than the write-policy function, if you are using Policy Sentry as a python library.
 
     Arguments:
         cfg: The loaded YAML as a dict. Must follow Policy Sentry dictated format.
         minimize: Minimize the resulting statement with *safe* usage of wildcards to reduce policy length. Set this to the character length you want - for example, 0, or 4. Defaults to none.
+        conservative: Keep prefix wildcards only when their full catalog expansion is approved; rejected
+            prefixes remain explicit. To inspect the rejection report, drive a :class:`SidGroup` directly and
+            read its ``conservative_report`` attribute after calling ``process_template``.
     Returns:
         Dictionary: The JSON policy
     """
     sid_group = SidGroup()
-    return sid_group.process_template(cfg, minimize)
+    return sid_group.process_template(cfg, minimize, conservative=conservative)

@@ -167,3 +167,41 @@ policy_sentry write-policy --input-file crud.yml
 As you can see, we used the minimization command to shave off 200 characters from the resulting IAM policy.
 
 This becomes more and more useful as the amount of ARNs used in the policy add up.
+
+## Conservative compression
+
+A prefix wildcard such as `ssm:getpar*` is safe against the action catalog at
+generation time, but it is an *open* prefix: if AWS later releases a new action
+sharing that prefix (for example `ssm:GetParameterQuota`), an already deployed
+policy grants it without anyone changing the policy. The granted action set
+therefore has no fixed meaning over time.
+
+Pass `--conservative` (or `conservative=True` when using Policy Sentry as a
+library) to bind every wildcard to a fixed meaning against the current catalog:
+
+```bash
+policy_sentry write-policy --input-file crud.yml --minimize 0 --conservative
+```
+
+Under conservative compression:
+
+* Narrow prefix wildcards such as `ssm:getpar*` are kept as explicit action
+  names, because they are *open* prefixes and a future same-prefix AWS action
+  would widen the grant. The only wildcard retained is the service-wide one
+  (`ssm:*`), and only when **every** catalog action in that service is
+  approved, which is already an explicit intent.
+* Explicitly excluded actions are never hidden behind a wildcard, because the
+  unfiltered catalog is used when deciding whether a prefix is safe.
+* Every prefix that is kept explicit is recorded. Library callers can read it
+  from `SidGroup.conservative_report`, and the lower-level
+  `policy_sentry.writing.minimize.get_last_conservative_report()` exposes the
+  same data. Each entry gives a `reason` and the concrete `blocked_by` actions:
+  - `unapproved_actions_matched`: the wildcard would also grant known actions
+    outside the approved set (including explicit exclusions).
+  - `open_prefix_future_actions`: every current match is approved, but a future
+    same-prefix AWS action could widen the grant.
+
+A runnable, catalog-free walkthrough of both rejection reasons (including a
+simulated AWS action addition, explicit exclusions, mixed-case input and mixed
+services) lives at
+`examples/library-usage/writing/conservative_minimization_demo.py`.

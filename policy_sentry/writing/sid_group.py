@@ -23,7 +23,11 @@ from policy_sentry.shared.constants import POLICY_LANGUAGE_VERSION
 from policy_sentry.util.actions import get_lowercase_action_list
 from policy_sentry.util.arns import does_arn_match, get_service_from_arn, parse_arn
 from policy_sentry.util.text import capitalize_first_character, strip_special_characters
-from policy_sentry.writing.minimize import minimize_statement_actions
+from policy_sentry.writing.minimize import (
+    ConservativeRejection,
+    get_last_conservative_report,
+    minimize_statement_actions,
+)
 from policy_sentry.writing.validate import check_actions_schema, check_crud_schema
 
 SANITIZE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9]+")
@@ -67,6 +71,9 @@ class SidGroup:
         self.skip_resource_constraints: list[str] = []
         self.exclude_actions: list[str] = []
         self.wildcard_only_single_actions: list[str] = []
+        # Prefixes kept explicit by the latest conservative minimization run,
+        # with the rejection reason and the unapproved actions behind it.
+        self.conservative_report: dict[str, ConservativeRejection] = {}
         # When a user requests all wildcard-only actions available under a service at a specific access level
         self.wildcard_only_service_read: list[str] = []
         self.wildcard_only_service_write: list[str] = []
@@ -201,13 +208,18 @@ class SidGroup:
         )
         self.add_wildcard_only_actions(provided_wildcard_actions)
 
-    def get_rendered_policy(self, minimize: int | None = None, effect: str = "Allow") -> dict[str, Any]:
+    def get_rendered_policy(
+        self, minimize: int | None = None, effect: str = "Allow", conservative: bool = False
+    ) -> dict[str, Any]:
         """
         Get the JSON rendered policy
 
         Arguments:
             minimize: Reduce the character count of policies without creating overlap with other action names
             effect: The IAM policy effect, either "Allow" or "Deny". Defaults to "Allow".
+            conservative: Keep narrow prefix wildcards as explicit actions so the granted set cannot be
+                widened by a future same-prefix AWS action. Only a fully-approved service-wide wildcard is
+                retained. Rejected prefixes are recorded in ``self.conservative_report``.
         Returns:
             Dictionary: The IAM Policy JSON
         """
@@ -217,6 +229,23 @@ class SidGroup:
         statements: list[dict[str, Any]] = []
         # Only set the actions to lowercase if minimize is provided
         all_actions = get_all_actions(lowercase=True)
+        if conservative:
+            self.conservative_report = {}
+
+        def _minimize(actions_to_minimize: list[str]) -> list[str]:
+            minimized = minimize_statement_actions(
+                actions_to_minimize, all_actions, minchars=minimize, conservative=conservative
+            )
+            if conservative:
+                for rejected_prefix, entry in get_last_conservative_report().items():
+                    merged = self.conservative_report.setdefault(
+                        rejected_prefix, {"reason": entry["reason"], "blocked_by": []}
+                    )
+                    merged["reason"] = entry["reason"]
+                    for blocked_action in entry["blocked_by"]:
+                        if blocked_action not in merged["blocked_by"]:
+                            merged["blocked_by"].append(blocked_action)
+            return minimized
 
         # render the policy
         sids_to_be_changed = []
@@ -241,7 +270,7 @@ class SidGroup:
             match_found = False
             if minimize is not None and isinstance(minimize, int):
                 logger.debug("Minimizing statements...")
-                actions = minimize_statement_actions(actions, all_actions, minchars=minimize)
+                actions = _minimize(actions)
                 # searching in the existing statements
                 # further minimizing the output
                 for stmt in statements:
@@ -274,7 +303,7 @@ class SidGroup:
                     stmt["Sid"] = create_policy_sid_namespace(arn_details["service"], "Mult", resource_sid_segment)
                     # If we have combined the statements, minimize it again
                     if minimize is not None and isinstance(minimize, int):
-                        actions = minimize_statement_actions(stmt["Action"], all_actions, minchars=minimize)
+                        actions = _minimize(stmt["Action"])
                         actions.sort()
                         stmt["Action"] = actions
         return {"Version": POLICY_LANGUAGE_VERSION, "Statement": statements}
@@ -452,7 +481,9 @@ class SidGroup:
         logger.debug("Getting the rendered policy")
         return self.get_rendered_policy()
 
-    def process_template(self, cfg: dict[str, Any], minimize: int | None = None) -> dict[str, Any]:
+    def process_template(
+        self, cfg: dict[str, Any], minimize: int | None = None, conservative: bool = False
+    ) -> dict[str, Any]:
         """
         Process the Policy Sentry template as a dict. This auto-detects whether or not the file is in CRUD mode or
         Actions mode.
@@ -460,6 +491,8 @@ class SidGroup:
         Arguments:
             cfg: The loaded YAML as a dict. Must follow Policy Sentry dictated format.
             minimize: Minimize the resulting statement with *safe* usage of wildcards to reduce policy length. Set this to the character length you want - for example, 0, or 4. Defaults to none.
+            conservative: When minimizing, keep a prefix wildcard only if every catalog action it matches is
+                approved; rejected prefixes stay explicit and are recorded in ``self.conservative_report``.
         Returns:
             Dictionary: The rendered IAM JSON Policy
         """
@@ -556,7 +589,7 @@ class SidGroup:
                 if cfg_actions is not None and cfg_actions[0] != "":
                     self.add_by_list_of_actions(cfg_actions)
 
-        return self.get_rendered_policy(minimize, effect=effect)
+        return self.get_rendered_policy(minimize, effect=effect, conservative=conservative)
 
     def add_wildcard_only_actions(self, provided_wildcard_actions: list[str]) -> None:
         """

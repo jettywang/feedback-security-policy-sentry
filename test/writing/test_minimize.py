@@ -1,9 +1,92 @@
-import unittest
 import json
-from policy_sentry.writing.sid_group import SidGroup
-from policy_sentry.writing.minimize import minimize_statement_actions
+import unittest
+
 from policy_sentry.querying.all import get_all_actions
 from policy_sentry.util.policy_files import get_sid_names_from_policy
+from policy_sentry.writing.minimize import (
+    get_last_conservative_report,
+    minimize_statement_actions,
+)
+from policy_sentry.writing.sid_group import SidGroup
+
+# Two tiny synthetic service catalogs. Catalog v2 simulates AWS shipping new
+# actions that share a prefix with actions already approved in catalog v1.
+CATALOG_V1 = {
+    "foo:getuser",
+    "foo:getrole",
+    "foo:putrecord",
+    "bar:listthings",
+    "bar:listwidgets",
+    "bar:deletewidget",
+}
+CATALOG_V2 = CATALOG_V1 | {"foo:getaccount", "bar:listaccounts"}
+
+
+class ConservativeMinimizeTestCase(unittest.TestCase):
+    def test_open_prefix_is_kept_explicit_against_future_actions(self):
+        # The two approved foo Get* actions would compress to "foo:g*" by
+        # default, but that open prefix would also absorb a future same-prefix
+        # action, so conservative mode keeps them explicit.
+        actions = ["Foo:GetUser", "Foo:GetRole"]
+        normal = minimize_statement_actions(actions, CATALOG_V1)
+        conservative = minimize_statement_actions(actions, CATALOG_V1, conservative=True)
+        self.assertEqual(normal, ["foo:g*"])
+        self.assertEqual(conservative, ["foo:getrole", "foo:getuser"])
+        self.assertEqual(
+            get_last_conservative_report(),
+            {"foo:g*": {"reason": "open_prefix_future_actions", "blocked_by": []}},
+        )
+
+    def test_new_same_prefix_action_is_reported_as_over_grant(self):
+        # After AWS adds foo:GetAccount, the would-be prefixes now match a
+        # known unapproved action and must be reported with that action.
+        actions = ["Foo:GetUser", "Foo:GetRole"]
+        conservative = minimize_statement_actions(actions, CATALOG_V2, conservative=True)
+        self.assertEqual(conservative, ["foo:getrole", "foo:getuser"])
+        report = get_last_conservative_report()
+        self.assertEqual(report["foo:getu*"]["reason"], "unapproved_actions_matched")
+        self.assertEqual(report["foo:getu*"]["blocked_by"], ["foo:getaccount"])
+        self.assertEqual(report["foo:getr*"]["blocked_by"], ["foo:getaccount"])
+
+    def test_explicit_exclusion_keeps_the_action_detail(self):
+        # Only GetUser is approved; GetRole and the newly added GetAccount are
+        # effectively excluded. The wildcard that would cover them is rejected
+        # and the concrete blocked actions are named.
+        conservative = minimize_statement_actions(["foo:GetUser"], CATALOG_V2, conservative=True)
+        self.assertEqual(conservative, ["foo:getuser"])
+        report = get_last_conservative_report()
+        self.assertEqual(report["foo:getu*"]["reason"], "unapproved_actions_matched")
+        self.assertEqual(
+            report["foo:getu*"]["blocked_by"],
+            ["foo:getaccount", "foo:getrole"],
+        )
+
+    def test_mixed_services_are_evaluated_independently(self):
+        actions = ["Foo:GetUser", "bar:ListThings"]
+        conservative = minimize_statement_actions(actions, CATALOG_V2, conservative=True)
+        self.assertEqual(conservative, ["bar:listthings", "foo:getuser"])
+        report = get_last_conservative_report()
+        self.assertIn("foo:getu*", report)
+        self.assertIn("bar:listt*", report)
+        # A foo prefix never reports bar actions and vice versa.
+        self.assertTrue(all(item.startswith("foo:") for item in report["foo:getu*"]["blocked_by"]))
+        self.assertTrue(all(item.startswith("bar:") for item in report["bar:listt*"]["blocked_by"]))
+
+    def test_whole_service_approval_keeps_service_wildcard(self):
+        # Approving every known foo action is an explicit, fixed intent, so the
+        # service-wide wildcard is the one wildcard conservative mode allows.
+        foo_actions = sorted(action for action in CATALOG_V2 if action.startswith("foo:"))
+        conservative = minimize_statement_actions(foo_actions, CATALOG_V2, conservative=True)
+        self.assertEqual(conservative, ["foo:*"])
+        self.assertEqual(get_last_conservative_report(), {})
+
+    def test_conservative_does_not_change_default_output(self):
+        # The flag is opt-in: without it the historical minimization is intact.
+        actions = ["Foo:GetUser", "Foo:GetRole"]
+        self.assertEqual(
+            minimize_statement_actions(actions, CATALOG_V2),
+            ["foo:getr*", "foo:getu*"],
+        )
 
 
 class MinimizeWildcardActionsTestCase(unittest.TestCase):
@@ -349,3 +432,26 @@ class MinimizeWildcardActionsTestCase(unittest.TestCase):
             len(actions),
             "There should be no duplicate strings in the actions.",
         )
+
+    def test_conservative_template_keeps_explicit_actions_and_reports(self):
+        # A normal minimization compresses SSM parameter actions to prefix
+        # wildcards. Conservative mode must keep them explicit because the
+        # prefix is open, and expose the rejected prefixes on the SidGroup.
+        cfg = {
+            "mode": "crud",
+            "read": ["arn:aws:ssm:us-east-1:123456789012:parameter/myparameter"],
+        }
+        normal_group = SidGroup()
+        normal_policy = normal_group.process_template(cfg, minimize=0)
+        normal_actions = normal_policy["Statement"][0]["Action"]
+        self.assertTrue(any("*" in action for action in normal_actions))
+
+        conservative_group = SidGroup()
+        conservative_policy = conservative_group.process_template(cfg, minimize=0, conservative=True)
+        conservative_actions = conservative_policy["Statement"][0]["Action"]
+        # Every granted action is an explicit, full action name.
+        self.assertTrue(all("*" not in action for action in conservative_actions))
+        self.assertTrue(conservative_group.conservative_report)
+        for entry in conservative_group.conservative_report.values():
+            self.assertIn(entry["reason"], ("unapproved_actions_matched", "open_prefix_future_actions"))
+            self.assertIsInstance(entry["blocked_by"], list)
