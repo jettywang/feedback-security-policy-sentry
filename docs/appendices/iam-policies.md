@@ -29,7 +29,8 @@ policy_sentry-generated IAM Policies:
     -   [Effect](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_effect.html):
         `Allow` or explicit `Deny`. If there is any overlap on an action
         or actions with Allow vs. Deny, the `Deny` effect overrides the
-        `Allow`.
+        `Allow`. Policy Sentry renders explicit denies via the template-level
+        `effect: Deny` key; see [Explicit Deny](../writing-policies/explicit-deny.md).
     -   [Action](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_action.html):
         This refers to the IAM action - i.e., `s3:GetObject`, or
         `ec2:DescribeInstances`. Action text in a statement can have

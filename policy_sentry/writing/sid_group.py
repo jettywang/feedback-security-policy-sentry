@@ -390,6 +390,11 @@ class SidGroup:
         """
         Takes a list of actions, queries the database for corresponding arns, adds them to the object.
 
+        The effect (Allow/Deny) is not known at this stage, so this method only populates the SID
+        groups. Call :meth:`get_rendered_policy` (or :meth:`process_template`, which forwards the
+        template's ``effect``) to render the final policy. Rendering here would silently pin every
+        statement to the default ``Allow`` effect and drop an explicit ``Deny``.
+
         Arguments:
             supplied_actions: A list of supplied actions
         """
@@ -449,8 +454,8 @@ class SidGroup:
             "resource constraints "
         )
         self.remove_actions_duplicated_in_wildcard_arn()
-        logger.debug("Getting the rendered policy")
-        return self.get_rendered_policy()
+        logger.debug("Actions added to the SID group; render it explicitly with get_rendered_policy().")
+        return self.sids
 
     def process_template(self, cfg: dict[str, Any], minimize: int | None = None) -> dict[str, Any]:
         """

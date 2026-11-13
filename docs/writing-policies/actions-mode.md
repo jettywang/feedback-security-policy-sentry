@@ -29,12 +29,14 @@ policy_sentry create-template --output-file actions.yml --template-type actions
 
 ```yaml
 mode: actions
-name: myRole
-description: '' # Insert value here
-role_arn: '' # Insert value here
+name: ''
+# Effect: Allow or Deny. Defaults to Allow.
+# effect: Deny
 actions:
-- ''  # Fill in your IAM actions here
+- ''
 ```
+
+Set `effect: Deny` to render every generated statement as an explicit deny; see [Explicit Deny](explicit-deny.md).
 
 -   Create a yaml file with the following contents:
 

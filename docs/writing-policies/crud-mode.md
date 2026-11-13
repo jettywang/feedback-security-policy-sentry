@@ -32,6 +32,8 @@ policy_sentry create-template --output-file crud.yml --template-type crud
 ```yaml
 mode: crud
 name: ''
+# Effect: Allow or Deny. Defaults to Allow.
+# effect: Deny
 # Specify resource ARNs
 read:
 - ''
@@ -42,9 +44,6 @@ list:
 tagging:
 - ''
 permissions-management:
-- ''
-# Skip resource constraint requirements by listing actions here.
-skip-resource-constraints:
 - ''
 # Actions that do not support resource constraints
 wildcard-only:
@@ -61,6 +60,13 @@ wildcard-only:
   - ''
   service-permissions-management:
   - ''
+# Skip resource constraint requirements by listing actions here.
+skip-resource-constraints:
+- ''
+# Exclude actions from the output by specifying them here. Accepts wildcards, like kms:Delete*
+exclude-actions:
+- ''
+# If this policy needs to include an AssumeRole action
 sts:
   assume-role:
     - ''
@@ -69,6 +75,8 @@ sts:
   assume-role-with-web-identity:
     - ''
 ```
+
+See [Explicit Deny](explicit-deny.md) for the meaning of the `effect` key and how it differs from `exclude-actions`.
 
 -   Then just fill it out:
 

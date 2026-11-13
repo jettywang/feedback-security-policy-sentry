@@ -39,6 +39,7 @@ nav:
         - Single actions: 'writing-policies/wildcard-only/single-actions.md'
         - Service-wide: 'writing-policies/wildcard-only/service-wide.md'
     - Actions Mode: 'writing-policies/actions-mode.md'
+    - Explicit Deny: 'writing-policies/explicit-deny.md'
     - Minimizing characters: 'writing-policies/minimization.md'
   - "<b>Querying the IAM Database</b>":
     - Overview: 'querying/querying.md'
